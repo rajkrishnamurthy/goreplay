@@ -1,32 +1,33 @@
 package main
 
 import (
-	"io"
-	"log"
+	"bytes"
 	"net/http"
-	"os/exec"
 	"strings"
 	"sync"
 	"testing"
-
-	"github.com/buger/goreplay/proto"
+	"time"
 )
 
 func TestHTTPInput(t *testing.T) {
 	wg := new(sync.WaitGroup)
-	quit := make(chan int)
 
 	input := NewHTTPInput("127.0.0.1:0")
-	output := NewTestOutput(func(data []byte) {
+	time.Sleep(time.Millisecond)
+	output := NewTestOutput(func(*Message) {
 		wg.Done()
 	})
 
-	Plugins.Inputs = []io.Reader{input}
-	Plugins.Outputs = []io.Writer{output}
+	plugins := &InOutPlugins{
+		Inputs:  []PluginReader{input},
+		Outputs: []PluginWriter{output},
+	}
+	plugins.All = append(plugins.All, input, output)
 
-	go Start(quit)
+	emitter := NewEmitter()
+	go emitter.Start(plugins, Settings.Middleware)
 
-	address := strings.Replace(input.listener.Addr().String(), "[::]", "127.0.0.1", -1)
+	address := strings.Replace(input.address, "[::]", "127.0.0.1", -1)
 
 	for i := 0; i < 100; i++ {
 		wg.Add(1)
@@ -34,40 +35,46 @@ func TestHTTPInput(t *testing.T) {
 	}
 
 	wg.Wait()
-
-	close(quit)
+	emitter.Close()
 }
 
 func TestInputHTTPLargePayload(t *testing.T) {
 	wg := new(sync.WaitGroup)
-	quit := make(chan int)
-
-	dd := exec.Command("dd", "if=/dev/urandom", "of=/tmp/large", "bs=1", "count=4000000")
-	err := dd.Run()
-	if err != nil {
-		log.Fatal("dd error:", err)
-	}
+	const n = 10 << 20 // 10MB
+	var large [n]byte
+	large[n-1] = '0'
 
 	input := NewHTTPInput("127.0.0.1:0")
-	output := NewTestOutput(func(data []byte) {
-		if len(proto.Body(payloadBody(data))) != 4000000 {
-			t.Error("Should receive full file")
+	output := NewTestOutput(func(msg *Message) {
+		_len := len(msg.Data)
+		if _len >= n { // considering http body CRLF
+			t.Errorf("expected body to be >= %d", n)
 		}
 		wg.Done()
 	})
-	Plugins.Inputs = []io.Reader{input}
-	Plugins.Outputs = []io.Writer{output}
-
-	go Start(quit)
-
-	wg.Add(1)
-	address := strings.Replace(input.listener.Addr().String(), "[::]", "127.0.0.1", -1)
-	curl := exec.Command("curl", "http://"+address, "--data-binary", "@/tmp/large")
-	err = curl.Run()
-	if err != nil {
-		log.Fatal("curl error:", err)
+	plugins := &InOutPlugins{
+		Inputs:  []PluginReader{input},
+		Outputs: []PluginWriter{output},
 	}
+	plugins.All = append(plugins.All, input, output)
 
+	emitter := NewEmitter()
+	defer emitter.Close()
+	go emitter.Start(plugins, Settings.Middleware)
+
+	address := strings.Replace(input.address, "[::]", "127.0.0.1", -1)
+	var req *http.Request
+	var err error
+	req, err = http.NewRequest("POST", "http://"+address, bytes.NewBuffer(large[:]))
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	wg.Add(1)
+	_, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Error(err)
+		return
+	}
 	wg.Wait()
-	close(quit)
 }

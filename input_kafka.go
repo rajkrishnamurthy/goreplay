@@ -9,18 +9,18 @@ import (
 	"github.com/Shopify/sarama/mocks"
 )
 
-// KafkaInput is used for recieving Kafka messages and
+// KafkaInput is used for receiving Kafka messages and
 // transforming them into HTTP payloads.
 type KafkaInput struct {
-	config    *KafkaConfig
+	config    *InputKafkaConfig
 	consumers []sarama.PartitionConsumer
 	messages  chan *sarama.ConsumerMessage
+	quit      chan struct{}
 }
 
-// NewKafkaInput creates instance of kafka consumer client.
-func NewKafkaInput(address string, config *KafkaConfig) *KafkaInput {
-	c := sarama.NewConfig()
-	// Configuration options go here
+// NewKafkaInput creates instance of kafka consumer client with TLS config
+func NewKafkaInput(address string, config *InputKafkaConfig, tlsConfig *KafkaTLSConfig) *KafkaInput {
+	c := NewKafkaConfig(tlsConfig)
 
 	var con sarama.Consumer
 
@@ -28,15 +28,14 @@ func NewKafkaInput(address string, config *KafkaConfig) *KafkaInput {
 		con = config.consumer
 	} else {
 		var err error
-		//con, err = sarama.NewConsumer([]string{config.host}, c)
-		con, err = sarama.NewConsumer(strings.Split(config.host, ","), c)
+		con, err = sarama.NewConsumer(strings.Split(config.Host, ","), c)
 
 		if err != nil {
 			log.Fatalln("Failed to start Sarama(Kafka) consumer:", err)
 		}
 	}
 
-	partitions, err := con.Partitions(config.topic)
+	partitions, err := con.Partitions(config.Topic)
 	if err != nil {
 		log.Fatalln("Failed to collect Sarama(Kafka) partitions:", err)
 	}
@@ -45,10 +44,11 @@ func NewKafkaInput(address string, config *KafkaConfig) *KafkaInput {
 		config:    config,
 		consumers: make([]sarama.PartitionConsumer, len(partitions)),
 		messages:  make(chan *sarama.ConsumerMessage, 256),
+		quit:      make(chan struct{}),
 	}
 
 	for index, partition := range partitions {
-		consumer, err := con.ConsumePartition(config.topic, partition, sarama.OffsetNewest)
+		consumer, err := con.ConsumePartition(config.Topic, partition, sarama.OffsetNewest)
 		if err != nil {
 			log.Fatalln("Failed to start Sarama(Kafka) partition consumer:", err)
 		}
@@ -61,10 +61,7 @@ func NewKafkaInput(address string, config *KafkaConfig) *KafkaInput {
 			}
 		}(consumer)
 
-		if Settings.verbose {
-			// Start infinite loop for tracking errors for kafka producer.
-			go i.ErrorHandler(consumer)
-		}
+		go i.ErrorHandler(consumer)
 
 		i.consumers[index] = consumer
 	}
@@ -75,33 +72,49 @@ func NewKafkaInput(address string, config *KafkaConfig) *KafkaInput {
 // ErrorHandler should receive errors
 func (i *KafkaInput) ErrorHandler(consumer sarama.PartitionConsumer) {
 	for err := range consumer.Errors() {
-		log.Println("Failed to read access log entry:", err)
+		Debug(1, "Failed to read access log entry:", err)
 	}
 }
 
-func (i *KafkaInput) Read(data []byte) (int, error) {
-	message := <-i.messages
-
-	if !i.config.useJSON {
-		copy(data, message.Value)
-		return len(message.Value), nil
+// PluginRead a reads message from this plugin
+func (i *KafkaInput) PluginRead() (*Message, error) {
+	var message *sarama.ConsumerMessage
+	var msg Message
+	select {
+	case <-i.quit:
+		return nil, ErrorStopped
+	case message = <-i.messages:
 	}
 
-	var kafkaMessage KafkaMessage
-	json.Unmarshal(message.Value, &kafkaMessage)
+	msg.Data = message.Value
+	if i.config.UseJSON {
 
-	buf, err := kafkaMessage.Dump()
-	if err != nil {
-		log.Println("Failed to decode access log entry:", err)
-		return 0, err
+		var kafkaMessage KafkaMessage
+		json.Unmarshal(message.Value, &kafkaMessage)
+
+		var err error
+		msg.Data, err = kafkaMessage.Dump()
+		if err != nil {
+			Debug(1, "[INPUT-KAFKA] failed to decode access log entry:", err)
+			return nil, err
+		}
 	}
 
-	copy(data, buf)
+	// does it have meta
+	if isOriginPayload(msg.Data) {
+		msg.Meta, msg.Data = payloadMetaWithBody(msg.Data)
+	}
 
-	return len(buf), nil
+	return &msg, nil
 
 }
 
 func (i *KafkaInput) String() string {
-	return "Kafka Input: " + i.config.host + "/" + i.config.topic
+	return "Kafka Input: " + i.config.Host + "/" + i.config.Topic
+}
+
+// Close closes this plugin
+func (i *KafkaInput) Close() error {
+	close(i.quit)
+	return nil
 }

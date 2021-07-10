@@ -3,104 +3,109 @@
 package main
 
 import (
-	"io"
 	"sync"
 	"testing"
 )
 
 func TestOutputLimiter(t *testing.T) {
 	wg := new(sync.WaitGroup)
-	quit := make(chan int)
 
 	input := NewTestInput()
-	output := NewLimiter(NewTestOutput(func(data []byte) {
+	output := NewLimiter(NewTestOutput(func(*Message) {
 		wg.Done()
 	}), "10")
 	wg.Add(10)
 
-	Plugins.Inputs = []io.Reader{input}
-	Plugins.Outputs = []io.Writer{output}
+	plugins := &InOutPlugins{
+		Inputs:  []PluginReader{input},
+		Outputs: []PluginWriter{output},
+	}
+	plugins.All = append(plugins.All, input, output)
 
-	go Start(quit)
+	emitter := NewEmitter()
+	go emitter.Start(plugins, Settings.Middleware)
 
 	for i := 0; i < 100; i++ {
 		input.EmitGET()
 	}
 
 	wg.Wait()
-
-	close(quit)
+	emitter.Close()
 }
 
 func TestInputLimiter(t *testing.T) {
 	wg := new(sync.WaitGroup)
-	quit := make(chan int)
 
 	input := NewLimiter(NewTestInput(), "10")
-	output := NewTestOutput(func(data []byte) {
+	output := NewTestOutput(func(*Message) {
 		wg.Done()
 	})
 	wg.Add(10)
 
-	Plugins.Inputs = []io.Reader{input}
-	Plugins.Outputs = []io.Writer{output}
+	plugins := &InOutPlugins{
+		Inputs:  []PluginReader{input},
+		Outputs: []PluginWriter{output},
+	}
+	plugins.All = append(plugins.All, input, output)
 
-	go Start(quit)
+	emitter := NewEmitter()
+	go emitter.Start(plugins, Settings.Middleware)
 
 	for i := 0; i < 100; i++ {
 		input.(*Limiter).plugin.(*TestInput).EmitGET()
 	}
 
 	wg.Wait()
-
-	close(quit)
+	emitter.Close()
 }
 
 // Should limit all requests
 func TestPercentLimiter1(t *testing.T) {
 	wg := new(sync.WaitGroup)
-	quit := make(chan int)
 
 	input := NewTestInput()
-	output := NewLimiter(NewTestOutput(func(data []byte) {
+	output := NewLimiter(NewTestOutput(func(*Message) {
 		wg.Done()
 	}), "0%")
 
-	Plugins.Inputs = []io.Reader{input}
-	Plugins.Outputs = []io.Writer{output}
+	plugins := &InOutPlugins{
+		Inputs:  []PluginReader{input},
+		Outputs: []PluginWriter{output},
+	}
+	plugins.All = append(plugins.All, input, output)
 
-	go Start(quit)
+	emitter := NewEmitter()
+	go emitter.Start(plugins, Settings.Middleware)
 
 	for i := 0; i < 100; i++ {
 		input.EmitGET()
 	}
 
 	wg.Wait()
-
-	close(quit)
 }
 
 // Should not limit at all
 func TestPercentLimiter2(t *testing.T) {
 	wg := new(sync.WaitGroup)
-	quit := make(chan int)
 
 	input := NewTestInput()
-	output := NewLimiter(NewTestOutput(func(data []byte) {
+	output := NewLimiter(NewTestOutput(func(*Message) {
 		wg.Done()
 	}), "100%")
 	wg.Add(100)
 
-	Plugins.Inputs = []io.Reader{input}
-	Plugins.Outputs = []io.Writer{output}
+	plugins := &InOutPlugins{
+		Inputs:  []PluginReader{input},
+		Outputs: []PluginWriter{output},
+	}
+	plugins.All = append(plugins.All, input, output)
 
-	go Start(quit)
+	emitter := NewEmitter()
+	go emitter.Start(plugins, Settings.Middleware)
 
 	for i := 0; i < 100; i++ {
 		input.EmitGET()
 	}
 
 	wg.Wait()
-
-	close(quit)
 }

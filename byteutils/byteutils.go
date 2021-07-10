@@ -1,5 +1,9 @@
-// Package byteutils probvides helpers for working with byte slices
+// Package byteutils provides helpers for working with byte slices
 package byteutils
+
+import (
+	"unsafe"
+)
 
 // Cut elements from slice for a given range
 func Cut(a []byte, from, to int) []byte {
@@ -40,4 +44,9 @@ func Replace(a []byte, from, to int, new []byte) []byte {
 	// same size
 	copy(a[from:], new)
 	return a
+}
+
+// SliceToString preferred for large body payload (zero allocation and faster)
+func SliceToString(buf []byte) string {
+	return *(*string)(unsafe.Pointer(&buf))
 }

@@ -7,7 +7,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
-	"io"
 	"io/ioutil"
 	"log"
 	"math/big"
@@ -20,17 +19,20 @@ import (
 
 func TestTCPInput(t *testing.T) {
 	wg := new(sync.WaitGroup)
-	quit := make(chan int)
 
 	input := NewTCPInput("127.0.0.1:0", &TCPInputConfig{})
-	output := NewTestOutput(func(data []byte) {
+	output := NewTestOutput(func(*Message) {
 		wg.Done()
 	})
 
-	Plugins.Inputs = []io.Reader{input}
-	Plugins.Outputs = []io.Writer{output}
+	plugins := &InOutPlugins{
+		Inputs:  []PluginReader{input},
+		Outputs: []PluginWriter{output},
+	}
+	plugins.All = append(plugins.All, input, output)
 
-	go Start(quit)
+	emitter := NewEmitter()
+	go emitter.Start(plugins, Settings.Middleware)
 
 	tcpAddr, err := net.ResolveTCPAddr("tcp", input.listener.Addr().String())
 
@@ -39,7 +41,6 @@ func TestTCPInput(t *testing.T) {
 	}
 
 	conn, err := net.DialTCP("tcp", nil, tcpAddr)
-
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -48,13 +49,16 @@ func TestTCPInput(t *testing.T) {
 
 	for i := 0; i < 100; i++ {
 		wg.Add(1)
-		conn.Write(msg)
-		conn.Write([]byte(payloadSeparator))
+		if _, err = conn.Write(msg); err == nil {
+			_, err = conn.Write(payloadSeparatorAsBytes)
+		}
+		if err != nil {
+			t.Error(err)
+			return
+		}
 	}
-
 	wg.Wait()
-
-	close(quit)
+	emitter.Close()
 }
 
 func genCertificate(template *x509.Certificate) ([]byte, []byte) {
@@ -96,21 +100,24 @@ func TestTCPInputSecure(t *testing.T) {
 	}()
 
 	wg := new(sync.WaitGroup)
-	quit := make(chan int)
 
 	input := NewTCPInput("127.0.0.1:0", &TCPInputConfig{
-		secure:          true,
-		certificatePath: serverCertPemFile.Name(),
-		keyPath:         serverPrivPemFile.Name(),
+		Secure:          true,
+		CertificatePath: serverCertPemFile.Name(),
+		KeyPath:         serverPrivPemFile.Name(),
 	})
-	output := NewTestOutput(func(data []byte) {
+	output := NewTestOutput(func(*Message) {
 		wg.Done()
 	})
 
-	Plugins.Inputs = []io.Reader{input}
-	Plugins.Outputs = []io.Writer{output}
+	plugins := &InOutPlugins{
+		Inputs:  []PluginReader{input},
+		Outputs: []PluginWriter{output},
+	}
+	plugins.All = append(plugins.All, input, output)
 
-	go Start(quit)
+	emitter := NewEmitter()
+	go emitter.Start(plugins, Settings.Middleware)
 
 	conf := &tls.Config{
 		InsecureSkipVerify: true,
@@ -131,6 +138,5 @@ func TestTCPInputSecure(t *testing.T) {
 	}
 
 	wg.Wait()
-
-	close(quit)
+	emitter.Close()
 }

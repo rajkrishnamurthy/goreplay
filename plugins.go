@@ -1,23 +1,38 @@
 package main
 
 import (
-	"io"
 	"reflect"
 	"strings"
-	"sync"
 )
+
+// Message represents data across plugins
+type Message struct {
+	Meta []byte // metadata
+	Data []byte // actual data
+}
+
+// PluginReader is an interface for input plugins
+type PluginReader interface {
+	PluginRead() (msg *Message, err error)
+}
+
+// PluginWriter is an interface for output plugins
+type PluginWriter interface {
+	PluginWrite(msg *Message) (n int, err error)
+}
+
+// PluginReadWriter is an interface for plugins that support reading and writing
+type PluginReadWriter interface {
+	PluginReader
+	PluginWriter
+}
 
 // InOutPlugins struct for holding references to plugins
 type InOutPlugins struct {
-	Inputs  []io.Reader
-	Outputs []io.Writer
+	Inputs  []PluginReader
+	Outputs []PluginWriter
 	All     []interface{}
 }
-
-var pluginMu sync.Mutex
-
-// Plugins holds all the plugin objects
-var Plugins *InOutPlugins = new(InOutPlugins)
 
 // extractLimitOptions detects if plugin get called with limiter support
 // Returns address and limit
@@ -33,8 +48,8 @@ func extractLimitOptions(options string) (string, string) {
 
 // Automatically detects type of plugin and initialize it
 //
-// See this article if curious about relfect stuff below: http://blog.burntsushi.net/type-parametric-functions-golang
-func registerPlugin(constructor interface{}, options ...interface{}) {
+// See this article if curious about reflect stuff below: http://blog.burntsushi.net/type-parametric-functions-golang
+func (plugins *InOutPlugins) registerPlugin(constructor interface{}, options ...interface{}) {
 	var path, limit string
 	vc := reflect.ValueOf(constructor)
 
@@ -54,99 +69,94 @@ func registerPlugin(constructor interface{}, options ...interface{}) {
 
 	// Calling our constructor with list of given options
 	plugin := vc.Call(vo)[0].Interface()
-	pluginWrapper := plugin
 
 	if limit != "" {
-		pluginWrapper = NewLimiter(plugin, limit)
-	} else {
-		pluginWrapper = plugin
+		plugin = NewLimiter(plugin, limit)
 	}
-
-	_, isR := plugin.(io.Reader)
-	_, isW := plugin.(io.Writer)
 
 	// Some of the output can be Readers as well because return responses
-	if isR && !isW {
-		Plugins.Inputs = append(Plugins.Inputs, pluginWrapper.(io.Reader))
+	if r, ok := plugin.(PluginReader); ok {
+		plugins.Inputs = append(plugins.Inputs, r)
 	}
 
-	if isW {
-		Plugins.Outputs = append(Plugins.Outputs, pluginWrapper.(io.Writer))
+	if w, ok := plugin.(PluginWriter); ok {
+		plugins.Outputs = append(plugins.Outputs, w)
 	}
-
-	Plugins.All = append(Plugins.All, plugin)
+	plugins.All = append(plugins.All, plugin)
 }
 
-// InitPlugins specify and initialize all available plugins
-func InitPlugins() {
-	pluginMu.Lock()
-	defer pluginMu.Unlock()
+// NewPlugins specify and initialize all available plugins
+func NewPlugins() *InOutPlugins {
+	plugins := new(InOutPlugins)
 
-	for _, options := range Settings.inputDummy {
-		registerPlugin(NewDummyInput, options)
+	for _, options := range Settings.InputDummy {
+		plugins.registerPlugin(NewDummyInput, options)
 	}
 
-	for range Settings.outputDummy {
-		registerPlugin(NewDummyOutput)
+	for range Settings.OutputDummy {
+		plugins.registerPlugin(NewDummyOutput)
 	}
 
-	if Settings.outputStdout {
-		registerPlugin(NewDummyOutput)
+	if Settings.OutputStdout {
+		plugins.registerPlugin(NewDummyOutput)
 	}
 
-	if Settings.outputNull {
-		registerPlugin(NewNullOutput)
+	if Settings.OutputNull {
+		plugins.registerPlugin(NewNullOutput)
 	}
 
-	engine := EnginePcap
-	if Settings.inputRAWEngine == "raw_socket" {
-		engine = EngineRawSocket
-	} else if Settings.inputRAWEngine == "pcap_file" {
-		engine = EnginePcapFile
+	for _, options := range Settings.InputRAW {
+		plugins.registerPlugin(NewRAWInput, options, Settings.RAWInputConfig)
 	}
 
-	for _, options := range Settings.inputRAW {
-		registerPlugin(NewRAWInput, options, engine, Settings.inputRAWTrackResponse, Settings.inputRAWExpire, Settings.inputRAWRealIPHeader, Settings.inputRAWBpfFilter, Settings.inputRAWTimestampType, Settings.inputRawBufferSize)
+	for _, options := range Settings.InputTCP {
+		plugins.registerPlugin(NewTCPInput, options, &Settings.InputTCPConfig)
 	}
 
-	for _, options := range Settings.inputTCP {
-		registerPlugin(NewTCPInput, options, &Settings.inputTCPConfig)
+	for _, options := range Settings.OutputTCP {
+		plugins.registerPlugin(NewTCPOutput, options, &Settings.OutputTCPConfig)
 	}
 
-	for _, options := range Settings.outputTCP {
-		registerPlugin(NewTCPOutput, options, &Settings.outputTCPConfig)
+	for _, options := range Settings.InputFile {
+		plugins.registerPlugin(NewFileInput, options, Settings.InputFileLoop, Settings.InputFileReadDepth, Settings.InputFileMaxWait, Settings.InputFileDryRun)
 	}
 
-	for _, options := range Settings.inputFile {
-		registerPlugin(NewFileInput, options, Settings.inputFileLoop)
+	for _, path := range Settings.OutputFile {
+		if strings.HasPrefix(path, "s3://") {
+			plugins.registerPlugin(NewS3Output, path, &Settings.OutputFileConfig)
+		} else {
+			plugins.registerPlugin(NewFileOutput, path, &Settings.OutputFileConfig)
+		}
 	}
 
-	for _, options := range Settings.outputFile {
-		registerPlugin(NewFileOutput, options, &Settings.outputFileConfig)
-	}
-
-	for _, options := range Settings.inputHTTP {
-		registerPlugin(NewHTTPInput, options)
+	for _, options := range Settings.InputHTTP {
+		plugins.registerPlugin(NewHTTPInput, options)
 	}
 
 	// If we explicitly set Host header http output should not rewrite it
 	// Fix: https://github.com/buger/gor/issues/174
-	for _, header := range Settings.modifierConfig.headers {
+	for _, header := range Settings.ModifierConfig.Headers {
 		if header.Name == "Host" {
-			Settings.outputHTTPConfig.OriginalHost = true
+			Settings.OutputHTTPConfig.OriginalHost = true
 			break
 		}
 	}
 
-	for _, options := range Settings.outputHTTP {
-		registerPlugin(NewHTTPOutput, options, &Settings.outputHTTPConfig)
+	for _, options := range Settings.OutputHTTP {
+		plugins.registerPlugin(NewHTTPOutput, options, &Settings.OutputHTTPConfig)
 	}
 
-	if Settings.outputKafkaConfig.host != "" && Settings.outputKafkaConfig.topic != "" {
-		registerPlugin(NewKafkaOutput, "", &Settings.outputKafkaConfig)
+	for _, options := range Settings.OutputBinary {
+		plugins.registerPlugin(NewBinaryOutput, options, &Settings.OutputBinaryConfig)
 	}
 
-	if Settings.inputKafkaConfig.host != "" && Settings.inputKafkaConfig.topic != "" {
-		registerPlugin(NewKafkaInput, "", &Settings.inputKafkaConfig)
+	if Settings.OutputKafkaConfig.Host != "" && Settings.OutputKafkaConfig.Topic != "" {
+		plugins.registerPlugin(NewKafkaOutput, "", &Settings.OutputKafkaConfig, &Settings.KafkaTLSConfig)
 	}
+
+	if Settings.InputKafkaConfig.Host != "" && Settings.InputKafkaConfig.Topic != "" {
+		plugins.registerPlugin(NewKafkaInput, "", &Settings.InputKafkaConfig, &Settings.KafkaTLSConfig)
+	}
+
+	return plugins
 }

@@ -1,7 +1,14 @@
+vendor
 *.swp
 *.gor
-
+*.rpm
+*.dep
+*.deb
+*.pkg
+*.exe
+*.pprof
 *.out
+hey
 
 *.bin
 
@@ -21,6 +28,7 @@ gor
 
 .DS_Store
 
+goreplay
 corpus
 crashers
 suppressions

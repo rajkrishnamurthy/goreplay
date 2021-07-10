@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"math/rand"
 	"os"
 	"reflect"
@@ -11,19 +10,24 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/buger/goreplay/size"
 )
 
 func TestFileOutput(t *testing.T) {
 	wg := new(sync.WaitGroup)
-	quit := make(chan int)
 
 	input := NewTestInput()
-	output := NewFileOutput("/tmp/test_requests.gor", &FileOutputConfig{flushInterval: time.Minute, append: true})
+	output := NewFileOutput("/tmp/test_requests.gor", &FileOutputConfig{FlushInterval: time.Minute, Append: true})
 
-	Plugins.Inputs = []io.Reader{input}
-	Plugins.Outputs = []io.Writer{output}
+	plugins := &InOutPlugins{
+		Inputs:  []PluginReader{input},
+		Outputs: []PluginWriter{output},
+	}
+	plugins.All = append(plugins.All, input, output)
 
-	go Start(quit)
+	emitter := NewEmitter()
+	go emitter.Start(plugins, Settings.Middleware)
 
 	for i := 0; i < 100; i++ {
 		wg.Add(2)
@@ -32,29 +36,30 @@ func TestFileOutput(t *testing.T) {
 	}
 	time.Sleep(100 * time.Millisecond)
 	output.flush()
-
-	close(quit)
-
-	quit = make(chan int)
+	emitter.Close()
 
 	var counter int64
-	input2 := NewFileInput("/tmp/test_requests.gor", false)
-	output2 := NewTestOutput(func(data []byte) {
+	input2 := NewFileInput("/tmp/test_requests.gor", false, 100, 0, false)
+	output2 := NewTestOutput(func(*Message) {
 		atomic.AddInt64(&counter, 1)
 		wg.Done()
 	})
 
-	Plugins.Inputs = []io.Reader{input2}
-	Plugins.Outputs = []io.Writer{output2}
+	plugins2 := &InOutPlugins{
+		Inputs:  []PluginReader{input2},
+		Outputs: []PluginWriter{output2},
+	}
+	plugins2.All = append(plugins2.All, input2, output2)
 
-	go Start(quit)
+	emitter2 := NewEmitter()
+	go emitter2.Start(plugins2, Settings.Middleware)
 
 	wg.Wait()
-	close(quit)
+	emitter2.Close()
 }
 
 func TestFileOutputWithNameCleaning(t *testing.T) {
-	output := &FileOutput{pathTemplate: "./test_requests.gor", config: &FileOutputConfig{flushInterval: time.Minute, append: false}}
+	output := &FileOutput{pathTemplate: "./test_requests.gor", config: &FileOutputConfig{FlushInterval: time.Minute, Append: false}}
 	expectedFileName := "test_requests_0.gor"
 	output.updateName()
 
@@ -65,7 +70,7 @@ func TestFileOutputWithNameCleaning(t *testing.T) {
 }
 
 func TestFileOutputPathTemplate(t *testing.T) {
-	output := &FileOutput{pathTemplate: "/tmp/log-%Y-%m-%d-%S-%t", config: &FileOutputConfig{flushInterval: time.Minute, append: true}}
+	output := &FileOutput{pathTemplate: "/tmp/log-%Y-%m-%d-%S-%t", config: &FileOutputConfig{FlushInterval: time.Minute, Append: true}}
 	now := time.Now()
 	output.payloadType = []byte("3")
 	expectedPath := fmt.Sprintf("/tmp/log-%s-%s-%s-%s-3", now.Format("2006"), now.Format("01"), now.Format("02"), now.Format("05"))
@@ -77,22 +82,22 @@ func TestFileOutputPathTemplate(t *testing.T) {
 }
 
 func TestFileOutputMultipleFiles(t *testing.T) {
-	output := NewFileOutput("/tmp/log-%Y-%m-%d-%S", &FileOutputConfig{append: true, flushInterval: time.Minute})
+	output := NewFileOutput("/tmp/log-%Y-%m-%d-%S", &FileOutputConfig{Append: true, FlushInterval: time.Minute})
 
 	if output.file != nil {
 		t.Error("Should not initialize file if no writes")
 	}
 
-	output.Write([]byte("1 1 1\r\ntest"))
+	output.PluginWrite(&Message{Meta: []byte("1 1 1\r\n"), Data: []byte("test")})
 	name1 := output.file.Name()
 
-	output.Write([]byte("1 1 1\r\ntest"))
+	output.PluginWrite(&Message{Meta: []byte("1 1 1\r\n"), Data: []byte("test")})
 	name2 := output.file.Name()
 
 	time.Sleep(time.Second)
 	output.updateName()
 
-	output.Write([]byte("1 1 1\r\ntest"))
+	output.PluginWrite(&Message{Meta: []byte("1 1 1\r\n"), Data: []byte("test")})
 	name3 := output.file.Name()
 
 	if name2 != name1 {
@@ -108,22 +113,22 @@ func TestFileOutputMultipleFiles(t *testing.T) {
 }
 
 func TestFileOutputFilePerRequest(t *testing.T) {
-	output := NewFileOutput("/tmp/log-%Y-%m-%d-%S-%r", &FileOutputConfig{append: true})
+	output := NewFileOutput("/tmp/log-%Y-%m-%d-%S-%r", &FileOutputConfig{Append: true})
 
 	if output.file != nil {
 		t.Error("Should not initialize file if no writes")
 	}
 
-	output.Write([]byte("1 1 1\ntest"))
+	output.PluginWrite(&Message{Meta: []byte("1 1 1\r\n"), Data: []byte("test")})
 	name1 := output.file.Name()
 
-	output.Write([]byte("1 2 1\ntest"))
+	output.PluginWrite(&Message{Meta: []byte("1 2 1\r\n"), Data: []byte("test")})
 	name2 := output.file.Name()
 
 	time.Sleep(time.Second)
 	output.updateName()
 
-	output.Write([]byte("1 3 1\ntest"))
+	output.PluginWrite(&Message{Meta: []byte("1 3 1\r\n"), Data: []byte("test")})
 	name3 := output.file.Name()
 
 	if name3 == name2 || name2 == name1 || name3 == name1 {
@@ -136,14 +141,14 @@ func TestFileOutputFilePerRequest(t *testing.T) {
 }
 
 func TestFileOutputCompression(t *testing.T) {
-	output := NewFileOutput("/tmp/log-%Y-%m-%d-%S.gz", &FileOutputConfig{append: true, flushInterval: time.Minute})
+	output := NewFileOutput("/tmp/log-%Y-%m-%d-%S.gz", &FileOutputConfig{Append: true, FlushInterval: time.Minute})
 
 	if output.file != nil {
 		t.Error("Should not initialize file if no writes")
 	}
 
 	for i := 0; i < 1000; i++ {
-		output.Write([]byte("1 1 1\r\ntest"))
+		output.PluginWrite(&Message{Meta: []byte("1 1 1\r\n"), Data: []byte("test")})
 	}
 
 	name := output.file.Name()
@@ -155,26 +160,6 @@ func TestFileOutputCompression(t *testing.T) {
 	}
 
 	os.Remove(name)
-}
-
-func TestParseDataUnit(t *testing.T) {
-	var tests = []struct {
-		value string
-		size  int64
-	}{
-		{"100kb", dataUnitMap['k'] * 100},
-		{"100k", dataUnitMap['k'] * 100},
-		{"1kb", dataUnitMap['k']},
-		{"1g", dataUnitMap['g']},
-		{"10m", dataUnitMap['m'] * 10},
-		{"zsaa312", 0},
-	}
-
-	for _, c := range tests {
-		if parseDataUnit(c.value) != c.size {
-			t.Error(c.value, "should be", c.size, "instead", parseDataUnit(c.value))
-		}
-	}
 }
 
 func TestGetFileIndex(t *testing.T) {
@@ -220,17 +205,17 @@ func TestFileOutputAppendQueueLimitOverflow(t *testing.T) {
 	rnd := rand.Int63()
 	name := fmt.Sprintf("/tmp/%d", rnd)
 
-	output := NewFileOutput(name, &FileOutputConfig{append: false, flushInterval: time.Minute, queueLimit: 2})
+	output := NewFileOutput(name, &FileOutputConfig{Append: false, FlushInterval: time.Minute, QueueLimit: 2})
 
-	output.Write([]byte("1 1 1\r\ntest"))
+	output.PluginWrite(&Message{Meta: []byte("1 1 1\r\n"), Data: []byte("test")})
 	name1 := output.file.Name()
 
-	output.Write([]byte("1 1 1\r\ntest"))
+	output.PluginWrite(&Message{Meta: []byte("1 1 1\r\n"), Data: []byte("test")})
 	name2 := output.file.Name()
 
 	output.updateName()
 
-	output.Write([]byte("1 1 1\r\ntest"))
+	output.PluginWrite(&Message{Meta: []byte("1 1 1\r\n"), Data: []byte("test")})
 	name3 := output.file.Name()
 
 	if name2 != name1 || name1 != fmt.Sprintf("/tmp/%d_0", rnd) {
@@ -249,17 +234,17 @@ func TestFileOutputAppendQueueLimitNoOverflow(t *testing.T) {
 	rnd := rand.Int63()
 	name := fmt.Sprintf("/tmp/%d", rnd)
 
-	output := NewFileOutput(name, &FileOutputConfig{append: false, flushInterval: time.Minute, queueLimit: 3})
+	output := NewFileOutput(name, &FileOutputConfig{Append: false, FlushInterval: time.Minute, QueueLimit: 3})
 
-	output.Write([]byte("1 1 1\r\ntest"))
+	output.PluginWrite(&Message{Meta: []byte("1 1 1\r\n"), Data: []byte("test")})
 	name1 := output.file.Name()
 
-	output.Write([]byte("1 1 1\r\ntest"))
+	output.PluginWrite(&Message{Meta: []byte("1 1 1\r\n"), Data: []byte("test")})
 	name2 := output.file.Name()
 
 	output.updateName()
 
-	output.Write([]byte("1 1 1\r\ntest"))
+	output.PluginWrite(&Message{Meta: []byte("1 1 1\r\n"), Data: []byte("test")})
 	name3 := output.file.Name()
 
 	if name2 != name1 || name1 != fmt.Sprintf("/tmp/%d_0", rnd) {
@@ -278,17 +263,17 @@ func TestFileOutputAppendQueueLimitGzips(t *testing.T) {
 	rnd := rand.Int63()
 	name := fmt.Sprintf("/tmp/%d.gz", rnd)
 
-	output := NewFileOutput(name, &FileOutputConfig{append: false, flushInterval: time.Minute, queueLimit: 2})
+	output := NewFileOutput(name, &FileOutputConfig{Append: false, FlushInterval: time.Minute, QueueLimit: 2})
 
-	output.Write([]byte("1 1 1\r\ntest"))
+	output.PluginWrite(&Message{Meta: []byte("1 1 1\r\n"), Data: []byte("test")})
 	name1 := output.file.Name()
 
-	output.Write([]byte("1 1 1\r\ntest"))
+	output.PluginWrite(&Message{Meta: []byte("1 1 1\r\n"), Data: []byte("test")})
 	name2 := output.file.Name()
 
 	output.updateName()
 
-	output.Write([]byte("1 1 1\r\ntest"))
+	output.PluginWrite(&Message{Meta: []byte("1 1 1\r\n"), Data: []byte("test")})
 	name3 := output.file.Name()
 
 	if name2 != name1 || name1 != fmt.Sprintf("/tmp/%d_0.gz", rnd) {
@@ -321,18 +306,18 @@ func TestFileOutputAppendSizeLimitOverflow(t *testing.T) {
 
 	messageSize := len(message) + len(payloadSeparator)
 
-	output := NewFileOutput(name, &FileOutputConfig{append: false, flushInterval: time.Minute, sizeLimit: unitSizeVar(2 * messageSize)})
+	output := NewFileOutput(name, &FileOutputConfig{Append: false, FlushInterval: time.Minute, SizeLimit: size.Size(2 * messageSize)})
 
-	output.Write([]byte("1 1 1\r\ntest"))
+	output.PluginWrite(&Message{Meta: []byte("1 1 1\r\n"), Data: []byte("test")})
 	name1 := output.file.Name()
 
-	output.Write([]byte("1 1 1\r\ntest"))
+	output.PluginWrite(&Message{Meta: []byte("1 1 1\r\n"), Data: []byte("test")})
 	name2 := output.file.Name()
 
 	output.flush()
 	output.updateName()
 
-	output.Write([]byte("1 1 1\r\ntest"))
+	output.PluginWrite(&Message{Meta: []byte("1 1 1\r\n"), Data: []byte("test")})
 	name3 := output.file.Name()
 
 	if name2 != name1 || name1 != fmt.Sprintf("/tmp/%d_0", rnd) {

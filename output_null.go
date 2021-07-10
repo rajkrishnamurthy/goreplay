@@ -4,13 +4,14 @@ package main
 type NullOutput struct {
 }
 
-// NullOutput constructor for NullOutput
+// NewNullOutput constructor for NullOutput
 func NewNullOutput() (o *NullOutput) {
 	return new(NullOutput)
 }
 
-func (o *NullOutput) Write(data []byte) (int, error) {
-	return len(data), nil
+// PluginWrite writes message to this plugin
+func (o *NullOutput) PluginWrite(msg *Message) (int, error) {
+	return len(msg.Data) + len(msg.Meta), nil
 }
 
 func (o *NullOutput) String() string {

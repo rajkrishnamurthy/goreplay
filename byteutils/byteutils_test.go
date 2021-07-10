@@ -30,3 +30,12 @@ func TestReplace(t *testing.T) {
 		t.Error("Should replace when replacement length bigger")
 	}
 }
+
+func BenchmarkStringtoSlice(b *testing.B) {
+	var s string
+	var buf [1 << 20]byte
+	for i := 0; i < b.N; i++ {
+		s = SliceToString(buf[:])
+	}
+	_ = s // avoid gc to optimize away the loop body
+}

@@ -2,11 +2,11 @@ package main
 
 import (
 	"encoding/json"
-	"io"
 	"log"
 	"strings"
 	"time"
 
+	"github.com/buger/goreplay/byteutils"
 	"github.com/buger/goreplay/proto"
 
 	"github.com/Shopify/sarama"
@@ -15,16 +15,16 @@ import (
 
 // KafkaOutput is used for sending payloads to kafka in JSON format.
 type KafkaOutput struct {
-	config   *KafkaConfig
+	config   *OutputKafkaConfig
 	producer sarama.AsyncProducer
 }
 
 // KafkaOutputFrequency in milliseconds
 const KafkaOutputFrequency = 500
 
-// NewKafkaOutput creates instance of kafka producer client.
-func NewKafkaOutput(address string, config *KafkaConfig) io.Writer {
-	c := sarama.NewConfig()
+// NewKafkaOutput creates instance of kafka producer client  with TLS config
+func NewKafkaOutput(address string, config *OutputKafkaConfig, tlsConfig *KafkaTLSConfig) PluginWriter {
+	c := NewKafkaConfig(tlsConfig)
 
 	var producer sarama.AsyncProducer
 
@@ -35,7 +35,7 @@ func NewKafkaOutput(address string, config *KafkaConfig) io.Writer {
 		c.Producer.Compression = sarama.CompressionSnappy
 		c.Producer.Flush.Frequency = KafkaOutputFrequency * time.Millisecond
 
-		brokerList := strings.Split(config.host, ",")
+		brokerList := strings.Split(config.Host, ",")
 
 		var err error
 		producer, err = sarama.NewAsyncProducer(brokerList, c)
@@ -49,10 +49,8 @@ func NewKafkaOutput(address string, config *KafkaConfig) io.Writer {
 		producer: producer,
 	}
 
-	if Settings.verbose {
-		// Start infinite loop for tracking errors for kafka producer.
-		go o.ErrorHandler()
-	}
+	// Start infinite loop for tracking errors for kafka producer.
+	go o.ErrorHandler()
 
 	return o
 }
@@ -60,40 +58,41 @@ func NewKafkaOutput(address string, config *KafkaConfig) io.Writer {
 // ErrorHandler should receive errors
 func (o *KafkaOutput) ErrorHandler() {
 	for err := range o.producer.Errors() {
-		log.Println("Failed to write access log entry:", err)
+		Debug(1, "Failed to write access log entry:", err)
 	}
 }
 
-func (o *KafkaOutput) Write(data []byte) (n int, err error) {
+// PluginWrite writes a message to this plugin
+func (o *KafkaOutput) PluginWrite(msg *Message) (n int, err error) {
 	var message sarama.StringEncoder
 
-	if !o.config.useJSON {
-		message = sarama.StringEncoder(data)
+	if !o.config.UseJSON {
+		message = sarama.StringEncoder(byteutils.SliceToString(msg.Meta) + byteutils.SliceToString(msg.Data))
 	} else {
-		headers := make(map[string]string)
-		proto.ParseHeaders([][]byte{data}, func(header []byte, value []byte) bool {
-			headers[string(header)] = string(value)
-			return true
-		})
+		mimeHeader := proto.ParseHeaders(msg.Data)
+		header := make(map[string]string)
+		for k, v := range mimeHeader {
+			header[k] = strings.Join(v, ", ")
+		}
 
-		meta := payloadMeta(data)
-		req := payloadBody(data)
+		meta := payloadMeta(msg.Meta)
+		req := msg.Data
 
 		kafkaMessage := KafkaMessage{
-			ReqURL:     string(proto.Path(req)),
-			ReqType:    string(meta[0]),
-			ReqID:      string(meta[1]),
-			ReqTs:      string(meta[2]),
-			ReqMethod:  string(proto.Method(req)),
-			ReqBody:    string(proto.Body(req)),
-			ReqHeaders: headers,
+			ReqURL:     byteutils.SliceToString(proto.Path(req)),
+			ReqType:    byteutils.SliceToString(meta[0]),
+			ReqID:      byteutils.SliceToString(meta[1]),
+			ReqTs:      byteutils.SliceToString(meta[2]),
+			ReqMethod:  byteutils.SliceToString(proto.Method(req)),
+			ReqBody:    byteutils.SliceToString(proto.Body(req)),
+			ReqHeaders: header,
 		}
 		jsonMessage, _ := json.Marshal(&kafkaMessage)
-		message = sarama.StringEncoder(jsonMessage)
+		message = sarama.StringEncoder(byteutils.SliceToString(jsonMessage))
 	}
 
 	o.producer.Input() <- &sarama.ProducerMessage{
-		Topic: o.config.topic,
+		Topic: o.config.Topic,
 		Value: message,
 	}
 

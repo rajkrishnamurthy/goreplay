@@ -2,36 +2,37 @@ package main
 
 import (
 	"bufio"
-	"io"
 	"log"
 	"net"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestTCPOutput(t *testing.T) {
 	wg := new(sync.WaitGroup)
-	quit := make(chan int)
 
 	listener := startTCP(func(data []byte) {
 		wg.Done()
 	})
 	input := NewTestInput()
-	output := NewTCPOutput(listener.Addr().String(), &TCPOutputConfig{})
+	output := NewTCPOutput(listener.Addr().String(), &TCPOutputConfig{Workers: 10})
 
-	Plugins.Inputs = []io.Reader{input}
-	Plugins.Outputs = []io.Writer{output}
+	plugins := &InOutPlugins{
+		Inputs:  []PluginReader{input},
+		Outputs: []PluginWriter{output},
+	}
 
-	go Start(quit)
+	emitter := NewEmitter()
+	go emitter.Start(plugins, Settings.Middleware)
 
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		input.EmitGET()
 	}
 
 	wg.Wait()
-
-	close(quit)
+	emitter.Close()
 }
 
 func startTCP(cb func([]byte)) net.Listener {
@@ -44,9 +45,9 @@ func startTCP(cb func([]byte)) net.Listener {
 	go func() {
 		for {
 			conn, _ := listener.Accept()
-			defer conn.Close()
 
-			go func() {
+			go func(conn net.Conn) {
+				defer conn.Close()
 				reader := bufio.NewReader(conn)
 				scanner := bufio.NewScanner(reader)
 				scanner.Split(payloadScanner)
@@ -54,7 +55,7 @@ func startTCP(cb func([]byte)) net.Listener {
 				for scanner.Scan() {
 					cb(scanner.Bytes())
 				}
-			}()
+			}(conn)
 		}
 	}()
 
@@ -63,26 +64,69 @@ func startTCP(cb func([]byte)) net.Listener {
 
 func BenchmarkTCPOutput(b *testing.B) {
 	wg := new(sync.WaitGroup)
-	quit := make(chan int)
 
 	listener := startTCP(func(data []byte) {
 		wg.Done()
 	})
 	input := NewTestInput()
-	output := NewTCPOutput(listener.Addr().String(), &TCPOutputConfig{})
-
-	Plugins.Inputs = []io.Reader{input}
-	Plugins.Outputs = []io.Writer{output}
-
-	go Start(quit)
-
-	b.ResetTimer()
+	input.data = make(chan []byte, b.N)
 	for i := 0; i < b.N; i++ {
-		wg.Add(1)
 		input.EmitGET()
 	}
+	wg.Add(b.N)
+	output := NewTCPOutput(listener.Addr().String(), &TCPOutputConfig{Workers: 10})
+
+	plugins := &InOutPlugins{
+		Inputs:  []PluginReader{input},
+		Outputs: []PluginWriter{output},
+	}
+
+	emitter := NewEmitter()
+	// avoid counting above initialization
+	b.ResetTimer()
+	go emitter.Start(plugins, Settings.Middleware)
 
 	wg.Wait()
+	emitter.Close()
+}
 
-	close(quit)
+func TestStickyDisable(t *testing.T) {
+	tcpOutput := TCPOutput{config: &TCPOutputConfig{Sticky: false, Workers: 10}}
+
+	for i := 0; i < 10; i++ {
+		index := tcpOutput.getBufferIndex(getTestBytes())
+		if index != (i+1)%10 {
+			t.Errorf("Sticky is disable. Got: %d want %d", index, (i+1)%10)
+		}
+	}
+}
+
+func TestBufferDistribution(t *testing.T) {
+	numberOfWorkers := 10
+	numberOfMessages := 10000
+	percentDistributionErrorRange := 20
+
+	buffer := make([]int, numberOfWorkers)
+	tcpOutput := TCPOutput{config: &TCPOutputConfig{Sticky: true, Workers: 10}}
+	for i := 0; i < numberOfMessages; i++ {
+		buffer[tcpOutput.getBufferIndex(getTestBytes())]++
+	}
+
+	expectedDistribution := numberOfMessages / numberOfWorkers
+	lowerDistribution := expectedDistribution - (expectedDistribution * percentDistributionErrorRange / 100)
+	upperDistribution := expectedDistribution + (expectedDistribution * percentDistributionErrorRange / 100)
+	for i := 0; i < numberOfWorkers; i++ {
+		if buffer[i] < lowerDistribution {
+			t.Errorf("Under expected distribution. Got %d expected lower distribution %d", buffer[i], lowerDistribution)
+		}
+		if buffer[i] > upperDistribution {
+			t.Errorf("Under expected distribution. Got %d expected upper distribution %d", buffer[i], upperDistribution)
+		}
+	}
+}
+
+func getTestBytes() []byte {
+	reqh := payloadHeader(RequestPayload, uuid(), time.Now().UnixNano(), -1)
+	reqb := append(reqh, []byte("GET / HTTP/1.1\r\nHost: www.w3.org\r\nUser-Agent: Go 1.1 package http\r\nAccept-Encoding: gzip\r\n\r\n")...)
+	return reqb
 }

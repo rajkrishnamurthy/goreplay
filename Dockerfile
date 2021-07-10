@@ -1,5 +1,11 @@
-FROM alpine:3.6
-RUN apk update && apk add ca-certificates && update-ca-certificates && apk add openssl
-RUN wget https://github.com/buger/goreplay/releases/download/v0.16.1/gor_0.16.1_x64.tar.gz -O gor.tar.gz
+FROM alpine:3.12 as builder
+
+ARG RELEASE_VERSION
+
+RUN apk add --no-cache ca-certificates openssl
+RUN wget https://github.com/buger/goreplay/releases/download/${RELEASE_VERSION}/gor_${RELEASE_VERSION}_x64.tar.gz -O gor.tar.gz
 RUN tar xzf gor.tar.gz
-ENTRYPOINT ["./goreplay"]
+
+FROM scratch
+COPY --from=builder /gor .
+ENTRYPOINT ["./gor"]

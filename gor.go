@@ -3,69 +3,63 @@
 package main
 
 import (
+	_ "expvar"
 	"flag"
-	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"runtime"
-	_ "runtime/debug"
 	"runtime/pprof"
 	"syscall"
 	"time"
 )
 
 var (
-	mode       string
 	cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
 	memprofile = flag.String("memprofile", "", "write memory profile to this file")
 )
 
-func loggingMiddleware(next http.Handler) http.Handler {
+func loggingMiddleware(addr string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/loop" {
+			_, err := http.Get("http://" + addr)
+			log.Println(err)
+		}
+
 		rb, _ := httputil.DumpRequest(r, false)
 		log.Println(string(rb))
 		next.ServeHTTP(w, r)
 	})
 }
 
-var closeCh chan int
-
 func main() {
-	closeCh = make(chan int)
-	// // Don't exit on panic
-	// defer func() {
-	// 	if r := recover(); r != nil {
-	// 		fmt.Printf("PANIC: pkg: %v %s \n", r, debug.Stack())
-	// 	}
-	// }()
-
-	// If not set via env cariable
-	if len(os.Getenv("GOMAXPROCS")) == 0 {
+	if os.Getenv("GOMAXPROCS") == "" {
 		runtime.GOMAXPROCS(runtime.NumCPU() * 2)
 	}
 
 	args := os.Args[1:]
+	var plugins *InOutPlugins
 	if len(args) > 0 && args[0] == "file-server" {
 		if len(args) != 2 {
 			log.Fatal("You should specify port and IP (optional) for the file server. Example: `gor file-server :80`")
 		}
 		dir, _ := os.Getwd()
 
-		log.Println("Started example file server for current directory on address ", args[1])
+		Debug(0, "Started example file server for current directory on address ", args[1])
 
-		log.Fatal(http.ListenAndServe(args[1], loggingMiddleware(http.FileServer(http.Dir(dir)))))
+		log.Fatal(http.ListenAndServe(args[1], loggingMiddleware(args[1], http.FileServer(http.Dir(dir)))))
 	} else {
 		flag.Parse()
-		InitPlugins()
+		checkSettings()
+		plugins = NewPlugins()
 	}
 
-	fmt.Println("Version:", VERSION)
+	log.Printf("[PPID %d and PID %d] Version:%s\n", os.Getppid(), os.Getpid(), VERSION)
 
-	if len(Plugins.Inputs) == 0 || len(Plugins.Outputs) == 0 {
+	if len(plugins.Inputs) == 0 || len(plugins.Outputs) == 0 {
 		log.Fatal("Required at least 1 input and 1 output")
 	}
 
@@ -77,33 +71,34 @@ func main() {
 		profileCPU(*cpuprofile)
 	}
 
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-c
-		finalize()
-		os.Exit(1)
-	}()
+	if Settings.Pprof != "" {
+		go func() {
+			log.Println(http.ListenAndServe(Settings.Pprof, nil))
+		}()
+	}
 
-	if Settings.exitAfter > 0 {
-		log.Println("Running gor for a duration of", Settings.exitAfter)
-		closeCh = make(chan int)
+	closeCh := make(chan int)
+	emitter := NewEmitter()
+	go emitter.Start(plugins, Settings.Middleware)
+	if Settings.ExitAfter > 0 {
+		log.Printf("Running gor for a duration of %s\n", Settings.ExitAfter)
 
-		time.AfterFunc(Settings.exitAfter, func() {
-			log.Println("Stopping gor after", Settings.exitAfter)
+		time.AfterFunc(Settings.ExitAfter, func() {
+			log.Printf("gor run timeout %s\n", Settings.ExitAfter)
 			close(closeCh)
 		})
 	}
-
-	Start(closeCh)
-}
-
-func finalize() {
-	for _, p := range Plugins.All {
-		if cp, ok := p.(io.Closer); ok {
-			cp.Close()
-		}
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	exit := 0
+	select {
+	case <-c:
+		exit = 1
+	case <-closeCh:
+		exit = 0
 	}
+	emitter.Close()
+	os.Exit(exit)
 }
 
 func profileCPU(cpuprofile string) {
@@ -117,7 +112,6 @@ func profileCPU(cpuprofile string) {
 		time.AfterFunc(30*time.Second, func() {
 			pprof.StopCPUProfile()
 			f.Close()
-			log.Println("Stop profiling after 30 seconds")
 		})
 	}
 }

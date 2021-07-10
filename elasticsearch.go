@@ -5,12 +5,11 @@ import (
 	"log"
 	"net/url"
 	"strings"
-	//"regexp"
 	"time"
 
 	"github.com/buger/goreplay/proto"
 
-	"github.com/mattbaird/elastigo/lib"
+	elastigo "github.com/mattbaird/elastigo/lib"
 )
 
 type ESUriErorr struct{}
@@ -58,7 +57,7 @@ type ESRequestResponse struct {
 //
 // Proper format is: scheme://[userinfo@]host/index_name
 // userinfo is: user[:password]
-// net/url.Parse() does not fail if scheme is not provided but actualy does not
+// net/url.Parse() does not fail if scheme is not provided but actually does not
 // handle URI properly.
 // So we must 'validate' URI format to match requirements to use net/url.Parse()
 func parseURI(URI string) (err error, index string) {
@@ -67,9 +66,10 @@ func parseURI(URI string) (err error, index string) {
 
 	if parseErr != nil {
 		err = new(ESUriErorr)
+		return
 	}
 
-	//	check URL validity by extracting host and undex values.
+	//	check URL validity by extracting host and index values.
 	host := parsedUrl.Host
 	urlPathParts := strings.Split(parsedUrl.Path, "/")
 	index = urlPathParts[len(urlPathParts)-1]
@@ -99,13 +99,9 @@ func (p *ESPlugin) Init(URI string) {
 	p.done = make(chan bool)
 	p.indexor.Start()
 
-	if Settings.verbose {
-		// Only start the ErrorHandler goroutine when in verbose mode
-		// no need to burn ressources otherwise
-		go p.ErrorHandler()
-	}
+	go p.ErrorHandler()
 
-	log.Println("Initialized Elasticsearch Plugin")
+	Debug(1, "Initialized Elasticsearch Plugin")
 	return
 }
 
@@ -117,7 +113,7 @@ func (p *ESPlugin) IndexerShutdown() {
 func (p *ESPlugin) ErrorHandler() {
 	for {
 		errBuf := <-p.indexor.ErrorChannel
-		log.Println(errBuf.Err)
+		Debug(1, "[ELASTICSEARCH]", errBuf.Err)
 	}
 }
 
@@ -128,6 +124,7 @@ func (p *ESPlugin) RttDurationToMs(d time.Duration) int64 {
 	return int64(fl)
 }
 
+// ResponseAnalyze send req and resp to ES
 func (p *ESPlugin) ResponseAnalyze(req, resp []byte, start, stop time.Time) {
 	if len(resp) == 0 {
 		// nil http response - skipped elasticsearch export for this request
@@ -135,7 +132,6 @@ func (p *ESPlugin) ResponseAnalyze(req, resp []byte, start, stop time.Time) {
 	}
 	t := time.Now()
 	rtt := p.RttDurationToMs(stop.Sub(start))
-	req = payloadBody(req)
 
 	esResp := ESRequestResponse{
 		ReqURL:               string(proto.Path(req)),
@@ -163,7 +159,7 @@ func (p *ESPlugin) ResponseAnalyze(req, resp []byte, start, stop time.Time) {
 	}
 	j, err := json.Marshal(&esResp)
 	if err != nil {
-		log.Println(err)
+		Debug(0, "[ELASTIC-RESPONSE]", err)
 	} else {
 		p.indexor.Index(p.Index, "RequestResponse", "", "", "", &t, j)
 	}
